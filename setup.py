@@ -5,7 +5,7 @@ setup(
 	version='1.0', 
 	description='Mitotic Stein variational gradient descent.', 
 	author='Jamie Liu', 
-	packages=find_packages(), 
+	packages=['msvgd'],
 	install_requires=[ 
 		'numpy',
 		'torch'
