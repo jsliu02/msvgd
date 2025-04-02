@@ -8,6 +8,7 @@ setup(
 	packages=['msvgd'],
 	install_requires=[ 
 		'numpy',
-		'torch'
+		'torch',
+		'tqdm'
 	], 
 ) 
