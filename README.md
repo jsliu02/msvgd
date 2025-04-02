@@ -7,5 +7,5 @@ To install with `pip`, use the command:
 
 # Dependencies
 * `numpy`
-* `tqdm`
 * `torch`
+* `tqdm`
