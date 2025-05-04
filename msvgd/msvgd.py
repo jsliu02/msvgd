@@ -49,7 +49,9 @@ class MSVGD():
         '''
         Compute the SVGD kernel.
         '''
-        L2sq = torch.cdist(particles, particles)**2
+        # faster pairwise distances
+        diffs = particles.tile(self.k, 1, 1) - particles.unsqueeze(1)
+        L2sq = torch.sum(diffs**2, axis=2)
         if h <= 0:
             h = L2sq.median() / self.logk
             
