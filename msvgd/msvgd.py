@@ -1,6 +1,17 @@
 import numpy as np
 import torch
 from tqdm.notebook import trange
+from collections.abc import Iterable
+
+def listify(val, length):
+    '''
+    Prepare a numerical/iterable argument for mitosis splits.
+    '''
+    if isinstance(val, Iterable) and type(val) is not dict:
+        if len(val) == length: return val
+        else: raise ValueError(f"Incorrect gradient descent hyperparameter argument length, got {len(val)}, expecting {length}.")
+    else:
+        return [val] * length
 
 class MSVGD():
     def __init__(self, score=None, logdensity=None, density=None):
@@ -78,6 +89,13 @@ class MSVGD():
         '''
         Solve mSVGD optimization.
         '''
+        optimizer = listify(optimizer, mitosis_splits+1)
+        optimizer_kwargs = listify(optimizer_kwargs, mitosis_splits+1)
+        max_iter = listify(max_iter, mitosis_splits+1)
+        atol = listify(atol, mitosis_splits+1)
+        rtol = listify(rtol, mitosis_splits+1)
+        bandwidth = listify(bandwidth, mitosis_splits+1)
+        
         match method:
             case "score":
                 self.gradient = self.gradient_score
@@ -99,18 +117,22 @@ class MSVGD():
             self.k = self.particles.shape[0]
             self.logk = np.log(self.k)
             self.MAP = (self.k == 1)
+
+            bandwidth_i = bandwidth[i]
+            atol_i = atol[i]
+            rtol_i = rtol[i]
             
             if mode == "autograd":
                 self.particles.requires_grad_()
             
-            opt = optimizer(params=[self.particles], **optimizer_kwargs)
+            opt = optimizer[i](params=[self.particles], **optimizer_kwargs[i])
 
-            with trange(max_iter) as pbar:
-                for iteration in range(max_iter):
+            with trange(max_iter[i]) as pbar:
+                for iteration in range(max_iter[i]):
                     # compute gradient
                     grad_particles = -self.gradient(self.particles)
                     if not self.MAP:
-                        kxy, dxkxy = self.svgd_kernel(self.particles, h=bandwidth)
+                        kxy, dxkxy = self.svgd_kernel(self.particles, h=bandwidth_i)
                         grad_particles = (kxy @ grad_particles - dxkxy) / self.k
                         
                     # monitor gradient magnitude
@@ -120,7 +142,7 @@ class MSVGD():
                             print(f'Iteration {iteration}, Max Grad = {m:.5f}')
 
                     # check convergence
-                    if torch.all(torch.abs(grad_particles) <= atol + rtol * torch.abs(self.particles)):
+                    if torch.all(torch.abs(grad_particles) <= atol_i + rtol_i * torch.abs(self.particles)):
                         pbar.update()
                         break
                     # update particles
