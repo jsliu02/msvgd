@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "msvgd"
+version = "0.1.0"
+description = "A JAX implementation of Mitotic Stein Variational Gradient Descent"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+authors = [
+  { name = "Jamie Liu", email = "you@example.com" }
+]
+dependencies = [
+  "jax",
+  "optax"
+]
+
+[project.urls]
+Homepage = "https://github.com/jamieliu2/msvgd"
