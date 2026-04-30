@@ -1,14 +1,14 @@
 # Description
-A Python package implementing mitotic Stein variational gradient descent.
+A JAX implementation of Mitotic Stein Variational Gradient Descent. Simple code examples are included in `tests.ipynb`.
+Tested on Python 3.10-3.14, JAX 0.9-0.10, optax 0.2.8.
 
 # Installation
-To install with `pip`, use the command:
-> `pip install git+https://github.com/jamieliu2/msvgd.git@main`
+To install:
+> `pip install  msvgd`
 
-To uninstall, use the command:
+To uninstall:
 > `pip uninstall msvgd`
 
 # Dependencies
-* `numpy`
-* `torch`
-* `tqdm`
+* `jax`
+* `optax`
