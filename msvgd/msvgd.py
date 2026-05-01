@@ -12,7 +12,7 @@ def _listify(val, length):
     '''
     if isinstance(val, Iterable) and type(val) is not dict:
         if len(val) == length:
-            return jnp.array(val)
+            return val
         else:
             raise ValueError(
                 f"Incorrect gradient descent hyperparameter argument length, "
@@ -54,15 +54,12 @@ class MSVGD():
     @partial(jax.jit, static_argnames=["self"])
     def _mitotic_split(self, particles, key):
         '''
-        Double the particle count by concatenating the current particles with a copy.
+        Double the particle count by concatenating the current particles with a jittered copy.
         In JAX particles are immutable arrays; we return the new array.
         '''
-        k = particles.shape[0]
-        sq_norms = jnp.sum(particles ** 2, axis=1) # (k,)
-        L2sq = sq_norms[:, None] + sq_norms[None, :] - 2 * particles @ particles.T # (k, k)
-        h = jnp.median(jnp.clip(L2sq, 0.0)) / jnp.log(k) # (1,)
-
-        jitter = jr.normal(key, shape=particles.shape) * jnp.sqrt(h / 2) # (k, d)
+        # empirical std of each dimension across current particles (k, d) -> (d,)
+        stds = jnp.std(particles, axis=0).clip(1e-6)   # (d,) — one scale per dimension
+        jitter = jax.random.normal(key, shape=particles.shape) * stds
         return jnp.concatenate([particles, particles + jitter], axis=0)
 
     def solve(
