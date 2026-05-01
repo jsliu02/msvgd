@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "msvgd"
-version = "0.1.1"
+version = "0.1.3"
 description = "A JAX implementation of Mitotic Stein Variational Gradient Descent"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -18,4 +18,4 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/jamieliu2/msvgd"
+Homepage = "https://github.com/jsliu02/msvgd"

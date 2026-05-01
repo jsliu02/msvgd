@@ -43,32 +43,36 @@ class MSVGD():
         # Pairwise squared L2 distances  (k, k)
         sq_norms = jnp.sum(particles ** 2, axis=1) # (k,)
         L2sq = sq_norms[:, None] + sq_norms[None, :] - 2 * particles @ particles.T
+
         # adaptive RBF bandwidth
-        h = jnp.where(h <= 0, jnp.median(jnp.clip(L2sq, 0.0)) / jnp.log(k), h) # (1,)
+        log_k = jnp.log(k)
+        upper_tri = jnp.triu_indices(k, k=1) # keep upper triangle, excluding diagonal
+        h = jnp.where(h <= 0, jnp.median(jnp.clip(L2sq[upper_tri], 0.0)) / log_k, h) # (1,)
 
         Kxy = jnp.exp(-L2sq / h) # (k, k)
         dxkxy = (Kxy.sum(axis=1, keepdims=True) * particles - Kxy @ particles) * (2.0 / h) # (k, d)
 
         return Kxy, dxkxy
 
-    @partial(jax.jit, static_argnames=["self"])
     def _mitotic_split(self, particles, key):
         '''
         Double the particle count by concatenating the current particles with a jittered copy.
         In JAX particles are immutable arrays; we return the new array.
+        Not JIT-compiled because it is called with a different `particles` shape each time.
         '''
         # empirical std of each dimension across current particles (k, d) -> (d,)
         stds = jnp.std(particles, axis=0).clip(1e-6)   # (d,) — one scale per dimension
         jitter = jax.random.normal(key, shape=particles.shape) * stds
+
         return jnp.concatenate([particles, particles + jitter], axis=0)
 
     def solve(
         self,
         x0,
         mitosis_splits=0,
-        key=jr.PRNGKey(8),
+        random_seed=8,
         optimizer=optax.adam,
-        optimizer_kwargs={"learning_rate": 1e-2},
+        optimizer_kwargs={"learning_rate": 0.1},
         max_iter=10_000,
         atol=1e-2,
         rtol=1e-8,
@@ -82,11 +86,11 @@ class MSVGD():
         ----------
         x0                  : array-like, initial particles (k, d)
         mitosis_splits      : number of particle-doubling steps
-        key                 : a jax.random key to sample mitosis jitters
+        random_seed         : int used to set jax.random key for sampling mitosis jitters
 
         Note: The following arguments may each be passed as a single value to be used globally
             or as a list of length `mitosis_splits+1`, containing (different) values for each mitosis phase.
-        optimizer           : an optax optimizer constructor, or list thereof
+        optimizer           : an optax optimizer constructor, or list thereof, configured for descent
         optimizer_kwargs    : dict of kwargs passed to the optimizer, or list thereof
         max_iter            : int or list of ints (one per phase)
         atol, rtol          : convergence tolerances,  all(grad <= atol + rtol * particles)
@@ -95,29 +99,30 @@ class MSVGD():
         monitor_convergence : int — print max grad every N iterations
             (0 = print status after each mitosis split, < 0 = fully silence)
         '''
+        key = jr.PRNGKey(random_seed)
         n_phases = mitosis_splits + 1
 
-        optimizer        = _listify(optimizer,        n_phases)
+        optimizer        = _listify(optimizer, n_phases)
         optimizer_kwargs = _listify(optimizer_kwargs, n_phases)
-        max_iter         = _listify(max_iter,         n_phases)
-        atol             = _listify(atol,             n_phases)
-        rtol             = _listify(rtol,             n_phases)
-        bandwidth        = _listify(bandwidth,        n_phases)
+        max_iter         = _listify(max_iter, n_phases)
+        atol             = _listify(atol, n_phases)
+        rtol             = _listify(rtol, n_phases)
+        bandwidth        = _listify(bandwidth, n_phases)
 
-        # ensure that particles are a JAX array
-        # typing will carry over if x0 was originally passed as a JAX array
+        # Ensure that particles are a JAX array
+        # Tsyping will carry over if x0 was originally passed as a JAX array
         particles = jnp.array(x0)
 
         for i in range(n_phases):
-            k      = particles.shape[0]
+            k = particles.shape[0]
             is_MAP = (k == 1)  # no SVGD kernel if doing MAP estimation
 
-            bw_i   = bandwidth[i]
+            bw_i = bandwidth[i]
             atol_i = atol[i]
             rtol_i = rtol[i]
-            mc     = monitor_convergence
+            mc = monitor_convergence
 
-            opt       = optimizer[i](**optimizer_kwargs[i])
+            opt = optimizer[i](**optimizer_kwargs[i])
             opt_state = opt.init(particles)
 
             # ------------------------------------------------------------------
@@ -173,5 +178,5 @@ class MSVGD():
             if i < mitosis_splits:
                 particles = self._mitotic_split(particles, jr.fold_in(key, i))
 
-        self.particles = particles
+        self.particles = particles.copy()
         return particles
