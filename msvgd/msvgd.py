@@ -5,22 +5,26 @@ import optax
 from functools import partial
 from collections.abc import Iterable
 
-def _listify(val, length):
+def _listify(val, length, dtype=None):
     '''
     Helper function to prepare a numerical/iterable argument for mitosis splits.
     Not user-facing.
     '''
     if isinstance(val, Iterable) and type(val) is not dict:
         if len(val) == length:
-            return val
+            listed = val
         else:
             raise ValueError(
                 f"Incorrect gradient descent hyperparameter argument length, "
                 f"got {len(val)}, expecting {length}."
             )
     else:
-        return [val] * length
+        listed = [val] * length
 
+    if dtype is not None:
+        return jnp.array(listed, dtype=dtype)
+    else:
+        return listed
 
 class MSVGD():
     def __init__(self, logdensity):
@@ -45,12 +49,12 @@ class MSVGD():
         L2sq = sq_norms[:, None] + sq_norms[None, :] - 2 * particles @ particles.T
 
         # adaptive RBF bandwidth
-        log_k = jnp.log(k)
+        log_k = jnp.log(jnp.array(k, dtype=particles.dtype))
         upper_tri = jnp.triu_indices(k, k=1) # keep upper triangle, excluding diagonal
-        h = jnp.where(h <= 0, jnp.median(jnp.clip(L2sq[upper_tri], 0.0)) / log_k, h) # (1,)
+        h = jnp.where(h <= 0, jnp.median(jnp.clip(L2sq[upper_tri], jnp.array(0.0, dtype=particles.dtype))) / log_k, h) # (1,)
 
         Kxy = jnp.exp(-L2sq / h) # (k, k)
-        dxkxy = (Kxy.sum(axis=1, keepdims=True) * particles - Kxy @ particles) * (2.0 / h) # (k, d)
+        dxkxy = (Kxy.sum(axis=1, keepdims=True) * particles - Kxy @ particles) * (jnp.array(2.0, dtype=particles.dtype) / h) # (k, d)
 
         return Kxy, dxkxy
 
@@ -61,8 +65,8 @@ class MSVGD():
         Not JIT-compiled because it is called with a different `particles` shape each time.
         '''
         # empirical std of each dimension across current particles (k, d) -> (d,)
-        stds = jnp.std(particles, axis=0).clip(1e-6)   # (d,) — one scale per dimension
-        jitter = jax.random.normal(key, shape=particles.shape) * stds
+        stds = jnp.std(particles, axis=0).clip(jnp.array(1e-6, dtype=particles.dtype))   # (d,) — one scale per dimension
+        jitter = jax.random.normal(key, shape=particles.shape, dtype=particles.dtype) * stds
 
         return jnp.concatenate([particles, particles + jitter], axis=0)
 
@@ -92,6 +96,8 @@ class MSVGD():
             or as a list of length `mitosis_splits+1`, containing (different) values for each mitosis phase.
         optimizer           : an optax optimizer constructor, or list thereof, configured for descent
         optimizer_kwargs    : dict of kwargs passed to the optimizer, or list thereof
+            Warning : It is necessary in some case for optimizer kwargs to have the same dtype as x0,
+                e.g. {"learning_rate" : jnp.array(0.1, dtype=x0.dtype)}
         max_iter            : int or list of ints (one per phase)
         atol, rtol          : convergence tolerances,  all(grad <= atol + rtol * particles)
         bandwidth           : RBF bandwidths (-1 = median heuristic)
@@ -105,9 +111,9 @@ class MSVGD():
         optimizer        = _listify(optimizer, n_phases)
         optimizer_kwargs = _listify(optimizer_kwargs, n_phases)
         max_iter         = _listify(max_iter, n_phases)
-        atol             = _listify(atol, n_phases)
-        rtol             = _listify(rtol, n_phases)
-        bandwidth        = _listify(bandwidth, n_phases)
+        atol             = _listify(atol, n_phases, x0.dtype)
+        rtol             = _listify(rtol, n_phases, x0.dtype)
+        bandwidth        = _listify(bandwidth, n_phases, x0.dtype)
 
         # Ensure that particles are a JAX array
         # Tsyping will carry over if x0 was originally passed as a JAX array
@@ -116,6 +122,7 @@ class MSVGD():
         for i in range(n_phases):
             k = particles.shape[0]
             is_MAP = (k == 1)  # no SVGD kernel if doing MAP estimation
+            k = jnp.array(k, dtype=particles.dtype)
 
             bw_i = bandwidth[i]
             atol_i = atol[i]
