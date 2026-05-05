@@ -4,6 +4,7 @@ import jax.random as jr
 import optax
 from functools import partial
 from collections.abc import Iterable
+import inspect
 
 def _listify(val, length, dtype=None):
     '''
@@ -27,13 +28,26 @@ def _listify(val, length, dtype=None):
         return listed
 
 class MSVGD():
-    def __init__(self, logdensity):
+    def __init__(self, logdensity, data=None):
         '''
         Define log-density of the target distribution, may be up to additive constant.
+
+        If solve will used batched gradient descent, should have signature logdensity(params, data_batch).
         '''
-        # grad of log-density w.r.t. a single particle, then vmap over all particles
-        _single_grad = jax.grad(lambda x: logdensity(x).sum())
-        self.gradient = jax.jit(jax.vmap(_single_grad, in_axes=0))
+        self.data = data
+
+        if len(inspect.signature(logdensity).parameters) == 2:
+            # logdensity must accept (x, data_batch)
+            def _single_grad(x, data_batch):
+                return jax.grad(lambda x: logdensity(x, data_batch).sum())(x)
+            self.gradient = jax.jit(jax.vmap(_single_grad, in_axes=(0, None)))
+            self._batched = True
+        elif len(inspect.signature(logdensity).parameters) == 1:
+            _single_grad = jax.grad(lambda x: logdensity(x).sum())
+            self.gradient = jax.jit(jax.vmap(_single_grad, in_axes=0))
+            self._batched = False
+        else:
+            raise ValueError("The logdensity has an invalid number of arguments (1 or 2 if data batching).")
         self.particles = None
 
     @partial(jax.jit, static_argnames=['self'])
@@ -77,6 +91,8 @@ class MSVGD():
         random_seed=8,
         optimizer=optax.adam,
         optimizer_kwargs={"learning_rate": 0.1},
+        batch_size=None,
+        is_MAP=False,
         max_iter=10_000,
         atol=1e-2,
         rtol=1e-8,
@@ -98,6 +114,8 @@ class MSVGD():
         optimizer_kwargs    : dict of kwargs passed to the optimizer, or list thereof
             Warning : It is necessary in some case for optimizer kwargs to have the same dtype as x0,
                 e.g. {"learning_rate" : jnp.array(0.1, dtype=x0.dtype)}
+        batch_size          : int or list of ints (one per phase) for stochastic optimization, None for full dataset
+        is_MAP              : bool whether to mode-find using on the gradient of only the logdensity
         max_iter            : int or list of ints (one per phase)
         atol, rtol          : convergence tolerances,  all(grad <= atol + rtol * particles)
         bandwidth           : RBF bandwidths (-1 = median heuristic)
@@ -110,10 +128,13 @@ class MSVGD():
 
         optimizer        = _listify(optimizer, n_phases)
         optimizer_kwargs = _listify(optimizer_kwargs, n_phases)
+        batch_size       = _listify(batch_size, n_phases)  # None means full batch
         max_iter         = _listify(max_iter, n_phases)
         atol             = _listify(atol, n_phases, x0.dtype)
         rtol             = _listify(rtol, n_phases, x0.dtype)
         bandwidth        = _listify(bandwidth, n_phases, x0.dtype)
+        if self._batched:
+            N = self.data.shape[0]
 
         # Ensure that particles are a JAX array
         # Tsyping will carry over if x0 was originally passed as a JAX array
@@ -121,9 +142,17 @@ class MSVGD():
 
         for i in range(n_phases):
             k = particles.shape[0]
-            is_MAP = (k == 1)  # no SVGD kernel if doing MAP estimation
+            if k == 1:
+                is_MAP = True  # no SVGD kernel if doing MAP estimation
             k = jnp.array(k, dtype=particles.dtype)
 
+            batch_size_i = batch_size[i]
+            if self._batched and batch_size_i is not None:
+                n_batches = N // batch_size_i
+                key, subkey = jr.split(key)
+                perm = jr.permutation(subkey, N)
+                data_shuffled = self.data[perm]
+    
             bw_i = bandwidth[i]
             atol_i = atol[i]
             rtol_i = rtol[i]
@@ -132,16 +161,26 @@ class MSVGD():
             opt = optimizer[i](**optimizer_kwargs[i])
             opt_state = opt.init(particles)
 
+
             # ------------------------------------------------------------------
             # Inner step: one gradient + optimizer update.
             # Captured variables (gradient, opt, is_MAP, k, bw_i) are all static
             # From JAX's perspective — they don't change during the while_loop.
             # ------------------------------------------------------------------
             def body_fn(carry):
-                particles, opt_state, _, iteration = carry
+                particles, opt_state, _, iteration, key = carry
+                key, subkey = jr.split(key)
+                # --- gradient computation ---
+                if self._batched and batch_size_i is not None:
+                    batch_start = (iteration % n_batches) * batch_size_i
+                    data_batch = jax.lax.dynamic_slice_in_dim(
+                        data_shuffled, batch_start, batch_size_i, axis=0)
+
+                    grad_particles = -self.gradient(particles, data_batch)
+                else:
+                    grad_particles = -self.gradient(particles)
 
                 # Compute SVGD gradient direction
-                grad_particles = -self.gradient(particles)
                 if not is_MAP:
                     kxy, dxkxy = self._svgd_kernel(particles, h=bw_i)
                     grad_particles = (kxy @ grad_particles - dxkxy) / k
@@ -159,10 +198,10 @@ class MSVGD():
 
                 updates, opt_state = opt.update(grad_particles, opt_state, particles)
                 particles = optax.apply_updates(particles, updates)
-                return (particles, opt_state, grad_particles, iteration + 1)
+                return (particles, opt_state, grad_particles, iteration + 1, key)
 
             def cond_fn(carry):
-                particles, _, grad_particles, iteration = carry
+                particles, _, grad_particles, iteration, _ = carry
                 not_converged = ~jnp.all(
                     jnp.abs(grad_particles) <= atol_i + rtol_i * jnp.abs(particles)
                 )
@@ -170,10 +209,12 @@ class MSVGD():
                 return not_converged & under_max_iter
 
             # Seed grad with inf so the convergence check always runs at least one step
-            init_grad = jnp.full_like(particles, jnp.inf)
-            init_carry = (particles, opt_state, init_grad, jnp.zeros((), jnp.int32))
+            key_sgd, key_mitosis = jr.split(jr.fold_in(key, i))
 
-            particles, _, grad_particles, n_iter = jax.lax.while_loop(
+            init_grad = jnp.full_like(particles, jnp.inf)
+            init_carry = (particles, opt_state, init_grad, jnp.zeros((), jnp.int32), key_sgd)
+
+            particles, _, grad_particles, n_iter, _ = jax.lax.while_loop(
                 cond_fn, body_fn, init_carry
             )
 
@@ -183,7 +224,7 @@ class MSVGD():
 
             # Mitotic split (except after the last phase)
             if i < mitosis_splits:
-                particles = self._mitotic_split(particles, jr.fold_in(key, i))
+                particles = self._mitotic_split(particles, key_mitosis)
 
         self.particles = particles.copy()
         return particles
