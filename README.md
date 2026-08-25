@@ -4,7 +4,7 @@ Tested on Python 3.10-3.14, JAX 0.9-0.10, optax 0.2.8.
 
 # Installation
 To install:
-> `pip install  msvgd`
+> `pip install msvgd`
 
 To uninstall:
 > `pip uninstall msvgd`
