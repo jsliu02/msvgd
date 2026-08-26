@@ -1,8 +1,10 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-jax.config.update("jax_default_matmul_precision", "highest")
 import optax
+
+import numpy as np
+
 from functools import partial
 from collections.abc import Iterable
 import inspect
@@ -20,6 +22,7 @@ def _listify(val, length, dtype=None):
         else: listed = val
     else: listed = [val] * length
     return jnp.array(listed, dtype=dtype) if dtype is not None else listed
+
 
 
 class MSVGD():
@@ -50,15 +53,21 @@ class MSVGD():
 
         self.particles = None
 
+
+    
     def pairwise_distance(self, particles, h=-1):
         k = particles.shape[0]
         # Pairwise squared L2 distances  (k, k)
         sq_norms = jnp.sum(particles ** 2, axis=1) # (k,)
-        L2sq = sq_norms[:, None] + sq_norms[None, :] - 2 * particles @ particles.T
+        # "highest" precision avoids catastrophic cancellation in this sum-of-squares expansion
+        with jax.default_matmul_precision("highest"):
+            L2sq = sq_norms[:, None] + sq_norms[None, :] - 2 * particles @ particles.T
 
         # adaptive RBF bandwidth
         log_k = jnp.log(jnp.array(k, dtype=particles.dtype))
-        upper_tri = jnp.triu_indices(k, k=1) # keep upper triangle, excluding diagonal
+        # np (not jnp): k is static, so this is a host-side constant baked into the trace once,
+        # instead of a scatter/reduce-window index construction re-run on every call
+        upper_tri = np.triu_indices(k, k=1) # keep upper triangle, excluding diagonal
         h = jnp.where(h <= 0, jnp.quantile(jnp.clip(L2sq[upper_tri], min=jnp.array(1e-6, dtype=particles.dtype)), 0.5) / log_k, h) # (1,)
         return L2sq, h
 
@@ -77,20 +86,109 @@ class MSVGD():
 
         return Kxy, dxkxy
 
+    @partial(jax.jit, static_argnames=['self'])
     def _mitotic_split(self, particles, key):
         '''
         Double the particle count by concatenating the current particles with a jittered copy.
         In JAX particles are immutable arrays; we return the new array.
-        Not JIT-compiled because it is called with a different `particles` shape each time.
         '''
-        # empirical std of each dimension across current particles (k, d) -> (d,)
-
-        # meds = jnp.median(particles, axis=0)
         _, h = self.pairwise_distance(particles, -1)
-        
+
         offspring = particles + jax.random.normal(key, shape=particles.shape, dtype=particles.dtype) * jnp.sqrt(h)
 
         return jnp.concatenate([particles, offspring], axis=0)
+
+
+    
+    @partial(jax.jit, static_argnames=[
+        'self', 'optimizer', 'opt_kwargs_keys', 'is_MAP', 'batch_size',
+        'grad_clip_enabled', 'monitor_convergence', 'phase',
+    ])
+    def _run_phase(
+        self, particles, data, key,
+        opt_kwargs_values, grad_clip_value, atol, rtol, bandwidth, max_iter, *,
+        optimizer, opt_kwargs_keys, is_MAP, batch_size, grad_clip_enabled, monitor_convergence, phase,
+    ):
+        '''
+        Run gradient descent (with optional SVGD kernel / batching) to convergence or max_iter,
+        for one mitosis phase.
+
+        This is JIT-compiled as a single unit, keyed on `self` plus the static arguments above
+        and the shapes/dtypes of the array arguments. Hyperparameter *values* (learning rate,
+        tolerances, bandwidth, max_iter, grad-clip norm) are passed as traced arguments rather
+        than baked in as Python constants, so calling `solve()` again with the same particle/data
+        shapes and the same static config reuses the compiled executable instead of retracing.
+        For an example of this use-case, see the annealing in the ring mixure example in tests.ipynb.
+        '''
+        k = particles.shape[0]
+
+        opt = optimizer(**dict(zip(opt_kwargs_keys, opt_kwargs_values)))
+        if grad_clip_enabled:
+            opt = optax.chain(optax.clip_by_global_norm(grad_clip_value), opt)
+        opt_state = opt.init(particles)
+
+        if batch_size is not None:
+            N = data.shape[0]
+            n_batches = N // batch_size
+
+        def body_fn(carry):
+            particles, opt_state, _, iteration, key, data_shuffled = carry
+            key, subkey = jr.split(key)
+
+            # Data batching logic
+            if batch_size is not None:
+                batch_start = (iteration % n_batches) * batch_size
+
+                # reshuffle at the start of every epoch, at iterations that reset batch index to 0 (including the first)
+                data_shuffled = jax.lax.cond(
+                    batch_start == 0,
+                    lambda: data[jr.permutation(subkey, N)],
+                    lambda: data_shuffled,
+                )
+                data_batch = jax.lax.dynamic_slice_in_dim(
+                    data_shuffled, batch_start, batch_size, axis=0)
+
+            else: data_batch = data
+
+            # --- Logdensity gradient computation ---
+            grad_particles = -self.gradient(particles, data_batch)
+
+            # Compute SVGD gradient direction
+            if not is_MAP:
+                kxy, dxkxy = self._svgd_kernel(particles, h=bandwidth)
+                grad_particles = (kxy @ grad_particles - dxkxy) / k
+
+            # Print max grad every `monitor_convergence` iterations (no output when monitor_convergence <= 0)
+            if monitor_convergence > 0:
+                jax.lax.cond(
+                    iteration % monitor_convergence == 0,
+                    lambda: jax.debug.print(
+                        "  Split {i} | Iter {it} | Max grad = {m:.5f}",
+                        i=phase, it=iteration, m=jnp.abs(grad_particles).max()
+                    ),
+                    lambda: None,
+                )
+
+            updates, opt_state = opt.update(grad_particles, opt_state, particles)
+            particles = optax.apply_updates(particles, updates)
+            return (particles, opt_state, grad_particles, iteration + 1, key, data_shuffled)
+
+        def cond_fn(carry):
+            particles, _, grad_particles, iteration, _, _ = carry
+            not_converged = ~jnp.all(
+                jnp.abs(grad_particles) <= atol + rtol * jnp.abs(particles)
+            )
+            under_max_iter = iteration < max_iter
+            return not_converged & under_max_iter
+
+        init_grad = jnp.full_like(particles, jnp.inf)
+        init_data_shuffled = data if batch_size is not None else None
+        init_carry = (particles, opt_state, init_grad, jnp.zeros((), jnp.int32), key, init_data_shuffled)
+
+        particles, _, grad_particles, n_iter, _, _ = jax.lax.while_loop(
+            cond_fn, body_fn, init_carry
+        )
+        return particles, grad_particles, n_iter
 
     def solve(
         self,
@@ -167,91 +265,34 @@ class MSVGD():
         particles = jnp.array(x0)
 
         for i in range(n_phases):
-            k = jnp.array(particles.shape[0], dtype=particles.dtype)
-            is_MAP_i = is_MAP[i] or (k == 1)  # no SVGD kernel if doing MAP estimation
+            k = particles.shape[0]
+            is_MAP_i = bool(is_MAP[i]) or (k == 1)  # no SVGD kernel if doing MAP estimation
 
             batch_size_i = batch_size[i]
-            if batch_size_i is not None:
-                n_batches = N // batch_size_i
 
-            bw_i = bandwidth[i]
-            atol_i = atol[i]
-            rtol_i = rtol[i]
-            mc = monitor_convergence
+            grad_clip_i = grad_clip[i]
+            grad_clip_enabled = grad_clip_i is not None
+            grad_clip_value = grad_clip_i if grad_clip_enabled else 0.0
 
-            opt = optimizer[i](**optimizer_kwargs[i])
-            if grad_clip[i] is not None:
-                opt = optax.chain(optax.clip_by_global_norm(grad_clip[i]), opt)
-            opt_state = opt.init(particles)
-
-
-            # ------------------------------------------------------------------
-            # Inner step: one gradient + optimizer update.
-            # Captured variables (gradient, opt, is_MAP_i, k, bw_i) are all static
-            # From JAX's perspective — they don't change during the while_loop.
-            # ------------------------------------------------------------------
-            def body_fn(carry):
-                particles, opt_state, _, iteration, key, data_shuffled = carry
-                key, subkey = jr.split(key)
-
-                # Data batching logic
-                if batch_size_i is not None:
-                    batch_start = (iteration % n_batches) * batch_size_i
-                    
-                    # reshuffle at the start of every epoch, at iterations that reset batch index to 0 (including the first)
-                    data_shuffled = jax.lax.cond(
-                        batch_start == 0,
-                        lambda: self.data[jr.permutation(subkey, N)],
-                        lambda: data_shuffled,
-                    )
-                    data_batch = jax.lax.dynamic_slice_in_dim(
-                        data_shuffled, batch_start, batch_size_i, axis=0)
-                    
-                else: data_batch = self.data
-
-                # --- Logdensity gradient computation ---
-                grad_particles = -self.gradient(particles, data_batch)
-
-                # Compute SVGD gradient direction
-                if not is_MAP_i:
-                    kxy, dxkxy = self._svgd_kernel(particles, h=bw_i)
-                    grad_particles = (kxy @ grad_particles - dxkxy) / k
-
-                # Print max grad every `mc` iterations (no output when mc == 0)
-                if mc > 0:
-                    jax.lax.cond(
-                        iteration % mc == 0,
-                        lambda: jax.debug.print(
-                            "  Split {i} | Iter {it} | Max grad = {m:.5f}",
-                            i=i, it=iteration, m=jnp.abs(grad_particles).max()
-                        ),
-                        lambda: None,
-                    )
-
-                updates, opt_state = opt.update(grad_particles, opt_state, particles)
-                particles = optax.apply_updates(particles, updates)
-                return (particles, opt_state, grad_particles, iteration + 1, key, data_shuffled)
-
-            def cond_fn(carry):
-                particles, _, grad_particles, iteration, _, _ = carry
-                not_converged = ~jnp.all(
-                    jnp.abs(grad_particles) <= atol_i + rtol_i * jnp.abs(particles)
-                )
-                under_max_iter = iteration < max_iter[i]
-                return not_converged & under_max_iter
+            opt_kwargs_keys = tuple(sorted(optimizer_kwargs[i].keys()))
+            opt_kwargs_values = tuple(optimizer_kwargs[i][kw] for kw in opt_kwargs_keys)
 
             # Seed grad with inf so the convergence check always runs at least one step
             key_sgd, key_mitosis = jr.split(jr.fold_in(key, i))
 
-            init_grad = jnp.full_like(particles, jnp.inf)
-            init_data_shuffled = self.data if batch_size_i is not None else None
-            init_carry = (particles, opt_state, init_grad, jnp.zeros((), jnp.int32), key_sgd, init_data_shuffled)
-
-            particles, _, grad_particles, n_iter, _, _ = jax.lax.while_loop(
-                cond_fn, body_fn, init_carry
+            particles, grad_particles, n_iter = self._run_phase(
+                particles, self.data, key_sgd,
+                opt_kwargs_values, grad_clip_value, atol[i], rtol[i], bandwidth[i], max_iter[i],
+                optimizer=optimizer[i],
+                opt_kwargs_keys=opt_kwargs_keys,
+                is_MAP=is_MAP_i,
+                batch_size=batch_size_i,
+                grad_clip_enabled=grad_clip_enabled,
+                monitor_convergence=monitor_convergence,
+                phase=i,
             )
 
-            if mc >= 0:
+            if monitor_convergence >= 0:
                 max_grad = float(jnp.abs(grad_particles).max())
                 print(f"Split {i} finished after {int(n_iter)} iterations | max grad = {max_grad:.5f}")
 
