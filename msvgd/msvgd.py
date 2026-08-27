@@ -206,7 +206,7 @@ class MSVGD():
         rtol=1e-8,
         bandwidth=-1,
         grad_clip=None,
-        monitor_convergence=0,
+        monitor_convergence=0
     ):
         '''
         Solve mSVGD optimization.
