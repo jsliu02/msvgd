@@ -237,7 +237,10 @@ class MSVGD():
         monitor_convergence : int — print max grad every N iterations
             (0 = print status after each mitosis split, < 0 = fully silence)
         '''
-        key = jr.PRNGKey(random_seed)
+        if isinstance(key, int):
+            key = jr.key(random_seed)
+        else: key = random_seed
+        
         n_phases = mitosis_splits + 1
 
         optimizer        = _listify(optimizer, n_phases)
