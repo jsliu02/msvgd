@@ -94,7 +94,16 @@ class MSVGD():
         '''
         _, h = self.pairwise_distance(particles, -1)
 
-        offspring = particles + jax.random.normal(key, shape=particles.shape, dtype=particles.dtype) * jnp.sqrt(h)
+        # h is the SVGD kernel bandwidth: it's calibrated against the *total* (summed over all
+        # dim dimensions) squared distance between particles, i.e. E[||x_i-x_j||^2] ~ h for a
+        # typical pair. Jittering every dimension i.i.d. with variance h (as opposed to h/dim)
+        # makes E[||offspring-parent||^2] = dim*h instead of h -- sqrt(dim) times too far in
+        # distance terms. For high-dimensional problems (e.g. hundreds of dims) this is a huge
+        # overshoot: offspring can land far outside any reasonable region, producing a
+        # destructive gradient on the very next step that can take many iterations to recover
+        # from (or fail to, within a fixed iteration budget).
+        dim = particles.shape[1]
+        offspring = particles + jax.random.normal(key, shape=particles.shape, dtype=particles.dtype) * jnp.sqrt(h / dim)
 
         return jnp.concatenate([particles, offspring], axis=0)
 
