@@ -37,7 +37,7 @@ class MSVGD():
         '''
         self.data = data
 
-        # handle logdensity signature
+        # Handle logdensity signature
         if len(inspect.signature(logdensity).parameters) == 1:
             self.logdensity = lambda x, y: logdensity(x)
             self._batch_ready = False
@@ -63,10 +63,10 @@ class MSVGD():
         with jax.default_matmul_precision("highest"):
             L2sq = sq_norms[:, None] + sq_norms[None, :] - 2 * particles @ particles.T
 
-        # adaptive RBF bandwidth
+        # Adaptive RBF bandwidth
         log_k = jnp.log(jnp.array(k, dtype=particles.dtype))
         # np (not jnp): k is static, so this is a host-side constant baked into the trace once,
-        # instead of a scatter/reduce-window index construction re-run on every call
+        # Instead of a scatter/reduce-window index construction re-run on every call
         upper_tri = np.triu_indices(k, k=1) # keep upper triangle, excluding diagonal
         h = jnp.where(h <= 0, jnp.quantile(jnp.clip(L2sq[upper_tri], min=jnp.array(1e-6, dtype=particles.dtype)), 0.5) / log_k, h) # (1,)
         return L2sq, h
@@ -139,7 +139,7 @@ class MSVGD():
             if batch_size is not None:
                 batch_start = (iteration % n_batches) * batch_size
 
-                # reshuffle at the start of every epoch, at iterations that reset batch index to 0 (including the first)
+                # Reshuffle at the start of every epoch, at iterations that reset batch index to 0 (including the first)
                 data_shuffled = jax.lax.cond(
                     batch_start == 0,
                     lambda: data[jr.permutation(subkey, N)],
@@ -150,7 +150,7 @@ class MSVGD():
 
             else: data_batch = data
 
-            # --- Logdensity gradient computation ---
+            # Logdensity gradient computation
             grad_particles = -self.gradient(particles, data_batch)
 
             # Compute SVGD gradient direction
@@ -181,6 +181,7 @@ class MSVGD():
             under_max_iter = iteration < max_iter
             return not_converged & under_max_iter
 
+        # Seed grad with inf so the convergence check always runs at least one step
         init_grad = jnp.full_like(particles, jnp.inf)
         init_data_shuffled = data if batch_size is not None else None
         init_carry = (particles, opt_state, init_grad, jnp.zeros((), jnp.int32), key, init_data_shuffled)
@@ -266,7 +267,7 @@ class MSVGD():
 
         for i in range(n_phases):
             k = particles.shape[0]
-            is_MAP_i = bool(is_MAP[i]) or (k == 1)  # no SVGD kernel if doing MAP estimation
+            is_MAP_i = bool(is_MAP[i]) or (k == 1)  # No SVGD kernel if doing MAP estimation
 
             batch_size_i = batch_size[i]
 
@@ -277,7 +278,6 @@ class MSVGD():
             opt_kwargs_keys = tuple(sorted(optimizer_kwargs[i].keys()))
             opt_kwargs_values = tuple(optimizer_kwargs[i][kw] for kw in opt_kwargs_keys)
 
-            # Seed grad with inf so the convergence check always runs at least one step
             key_sgd, key_mitosis = jr.split(jr.fold_in(key, i))
 
             particles, grad_particles, n_iter = self._run_phase(
