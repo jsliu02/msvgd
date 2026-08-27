@@ -237,7 +237,7 @@ class MSVGD():
         monitor_convergence : int — print max grad every N iterations
             (0 = print status after each mitosis split, < 0 = fully silence)
         '''
-        if isinstance(key, int):
+        if isinstance(random_seed, int):
             key = jr.key(random_seed)
         else: key = random_seed
         
