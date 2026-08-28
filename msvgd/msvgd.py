@@ -53,7 +53,6 @@ class MSVGD():
 
         self.particles = None
 
-
     
     def pairwise_distance(self, particles, h=-1):
         k = particles.shape[0]
@@ -86,6 +85,7 @@ class MSVGD():
 
         return Kxy, dxkxy
 
+        
     @partial(jax.jit, static_argnames=['self'])
     def _mitotic_split(self, particles, key):
         '''
@@ -96,27 +96,21 @@ class MSVGD():
 
         # h is the SVGD kernel bandwidth: it's calibrated against the *total* (summed over all
         # dim dimensions) squared distance between particles, i.e. E[||x_i-x_j||^2] ~ h for a
-        # typical pair. Jittering every dimension i.i.d. with variance h (as opposed to h/dim)
-        # makes E[||offspring-parent||^2] = dim*h instead of h -- sqrt(dim) times too far in
-        # distance terms. For high-dimensional problems (e.g. hundreds of dims) this is a huge
-        # overshoot: offspring can land far outside any reasonable region, producing a
-        # destructive gradient on the very next step that can take many iterations to recover
-        # from (or fail to, within a fixed iteration budget).
+        # typical pair. Jittering every dimension i.i.d. with variance h / (2*dim) gives
+        # E[||offspring-parent||^2] ~ h / 2.
         dim = particles.shape[1]
-        offspring = particles + jax.random.normal(key, shape=particles.shape, dtype=particles.dtype) * jnp.sqrt(h / dim)
+        offspring = particles + jax.random.normal(key, shape=particles.shape, dtype=particles.dtype) * jnp.sqrt(h / dim / 2)
 
         return jnp.concatenate([particles, offspring], axis=0)
 
-
-    
     @partial(jax.jit, static_argnames=[
         'self', 'optimizer', 'opt_kwargs_keys', 'is_MAP', 'batch_size',
-        'grad_clip_enabled', 'monitor_convergence', 'phase',
+        'grad_clip_enabled', 'monitor_enabled',
     ])
     def _run_phase(
         self, particles, data, key,
-        opt_kwargs_values, grad_clip_value, atol, rtol, bandwidth, max_iter, *,
-        optimizer, opt_kwargs_keys, is_MAP, batch_size, grad_clip_enabled, monitor_convergence, phase,
+        opt_kwargs_values, grad_clip_value, atol, rtol, bandwidth, max_iter, phase, monitor_interval, *,
+        optimizer, opt_kwargs_keys, is_MAP, batch_size, grad_clip_enabled, monitor_enabled,
     ):
         '''
         Run gradient descent (with optional SVGD kernel / batching) to convergence or max_iter,
@@ -124,10 +118,14 @@ class MSVGD():
 
         This is JIT-compiled as a single unit, keyed on `self` plus the static arguments above
         and the shapes/dtypes of the array arguments. Hyperparameter *values* (learning rate,
-        tolerances, bandwidth, max_iter, grad-clip norm) are passed as traced arguments rather
-        than baked in as Python constants, so calling `solve()` again with the same particle/data
-        shapes and the same static config reuses the compiled executable instead of retracing.
-        For an example of this use-case, see the annealing in the ring mixure example in tests.ipynb.
+        tolerances, bandwidth, max_iter, grad-clip norm, phase index, monitor interval) are
+        passed as traced arguments rather than baked in as Python constants, so calling `solve()`
+        again with the same particle/data shapes and the same static config reuses the compiled
+        executable instead of retracing. `phase` only feeds a jax.debug.print label and
+        `monitor_interval` only feeds a traced modulo check, so neither needs to be static --
+        only whether monitoring is enabled at all (`monitor_enabled`) changes which code path
+        gets compiled in. For an example of this use-case, see the annealing in the ring mixure
+        example in tests.ipynb.
         '''
         k = particles.shape[0]
 
@@ -167,10 +165,10 @@ class MSVGD():
                 kxy, dxkxy = self._svgd_kernel(particles, h=bandwidth)
                 grad_particles = (kxy @ grad_particles - dxkxy) / k
 
-            # Print max grad every `monitor_convergence` iterations (no output when monitor_convergence <= 0)
-            if monitor_convergence > 0:
+            # Print max grad every `monitor_interval` iterations (no output when monitoring disabled)
+            if monitor_enabled:
                 jax.lax.cond(
-                    iteration % monitor_convergence == 0,
+                    iteration % monitor_interval == 0,
                     lambda: jax.debug.print(
                         "  Split {i} | Iter {it} | Max grad = {m:.5f}",
                         i=phase, it=iteration, m=jnp.abs(grad_particles).max()
@@ -262,6 +260,11 @@ class MSVGD():
         bandwidth        = _listify(bandwidth, n_phases, x0.dtype)
         grad_clip        = _listify(grad_clip, n_phases)
 
+        monitor_enabled = monitor_convergence > 0
+        # only matters when monitor_enabled is False, in which case the value is inert
+        # (the print code path isn't even compiled in) -- 1 avoids a div/mod-by-zero trace
+        monitor_interval = monitor_convergence if monitor_enabled else 1
+
         if data is not None:
             self.data = data
         if any(batch_size):
@@ -295,13 +298,13 @@ class MSVGD():
             particles, grad_particles, n_iter = self._run_phase(
                 particles, self.data, key_sgd,
                 opt_kwargs_values, grad_clip_value, atol[i], rtol[i], bandwidth[i], max_iter[i],
+                i, monitor_interval,
                 optimizer=optimizer[i],
                 opt_kwargs_keys=opt_kwargs_keys,
                 is_MAP=is_MAP_i,
                 batch_size=batch_size_i,
                 grad_clip_enabled=grad_clip_enabled,
-                monitor_convergence=monitor_convergence,
-                phase=i,
+                monitor_enabled=monitor_enabled,
             )
 
             if monitor_convergence >= 0:
