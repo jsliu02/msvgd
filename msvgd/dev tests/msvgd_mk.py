@@ -1,3 +1,55 @@
+'''
+Experimental copy of msvgd.py implementing Multiple Kernel SVGD (MK-SVGD), from
+Ai, Liu, He & Xu, "Stein Variational Gradient Descent with Multiple Kernel" (mksvgd.pdf in
+this directory). Unlike the sliced-SVGD or reweighted-kernel variants, this doesn't change
+the FORM of the kernel -- it's still RBF -- it removes the single median-heuristic bandwidth
+choice, which the paper argues is often sub-optimal, by combining m RBF kernels at different
+bandwidths (a geometric ladder around the usual median-heuristic value) with data-dependent
+weights that require no extra optimization (Eq. 21: closed-form, from maximizing the
+Multiple Kernelized Stein Discrepancy s.t. ||w||_2=1).
+
+Per-kernel update (Eq. 12, identical in form to the standard single-kernel SVGD update):
+    phi_i(x) = (1/k) sum_j [score(x_j) k_i(x_j,x) + grad_{x_j} k_i(x_j,x)]
+and per-kernel weight (Eq. 21), proportional to that kernel's own (empirical, U-statistic)
+KSD magnitude:
+    w_i = ||phi_i||_H / sqrt(sum_i ||phi_i||_H^2),   ||phi_i||_H^2 = mean(M_i)
+where M_i is the standard KSD Gram matrix (Liu, Lee & Jordan 2016) built from base kernel
+k_i -- the same closed-form Stein-kernel formula used in
+magi_msvgd/test_stein_reweight*.py's post-hoc reweighting, but computed online here, once
+per bandwidth, per iteration. Kernels whose bandwidth currently shows a bigger apparent
+mismatch (larger KSD) get more say in the combined update -- the "multiple kernel learning"
+idea, with weights re-derived from scratch every iteration as particles move (no extra
+optimizer/state needed, unlike e.g. maxSKSD-rg's slicing-direction optimization).
+
+Final combined update (Eq. 19): phi_w(x) = sum_i w_i phi_i(x). With n_kernels=1 this reduces
+exactly to the standard single-bandwidth _svgd_kernel update (w=[1.0] trivially) -- used as
+the equivalence check in test_msvgd_mk.py.
+
+Bandwidth ladder: the paper uses "10 RBFs with a ratio of 0.1 between adjacent bandwidths"
+but doesn't fix a universal absolute range (it varies per experiment in their paper). The
+ladder is centered on the existing median-heuristic bandwidth h0 (recomputed every
+iteration, since particles move) and spans symmetrically around it:
+    h_i = h0 * ratio^(i - (n_kernels-1)/2),   i = 0, ..., n_kernels-1
+
+IMPORTANT, discovered empirically (see test_msvgd_mk.py): the paper's own weight formula
+(Eq. 21, w_i proportional to sqrt(mean(M_i))) is NOT safe for a wide ladder. The KSD Gram
+matrix's trace term has an explicit 1/h and 1/h^2 dependence (see _svgd_kernel-style
+derivation), which diverges as h -> 0 -- so a wide ladder (e.g. the naive "10 kernels, ratio
+10, spanning 9 orders of magnitude around h0" choice tried first) makes mean(M_i) for the
+smallest bandwidth many orders of magnitude larger than for the rest, so w concentrates
+essentially all its mass on the smallest, most degenerate kernel (h so small the kernel is
+near-identity, i.e. almost no repulsion). Empirically this caused catastrophic variance
+collapse on a toy correlated Gaussian (covariance off by 5x), not a mild degradation.
+The defaults below (n_kernels=5, ratio=2.0, spanning a 16x range around h0) were chosen
+specifically to avoid this divergence while still combining multiple bandwidths, and were
+verified not to collapse on the same toy problem -- this is an engineering safeguard on top
+of the paper's method, not something the paper itself addresses.
+
+Cost: L2sq and the score-dependent cross terms are computed once and shared across all m
+kernels (matching the paper's own complexity claim: cost scales linearly in m, not
+quadratically) -- see _mk_svgd_update.
+'''
+
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -25,7 +77,7 @@ def _listify(val, length, dtype=None):
 
 
 
-class MSVGD():
+class MKSVGD():
     def __init__(self, logdensity, data=None):
         '''
         Define log-density of the target distribution, may be up to additive constant.
@@ -70,102 +122,99 @@ class MSVGD():
         h = jnp.where(h <= 0, jnp.quantile(jnp.clip(L2sq[upper_tri], min=jnp.array(1e-6, dtype=particles.dtype)), 0.5) / log_k, h) # (1,)
         return L2sq, h
 
-    
+        
     @partial(jax.jit, static_argnames=['self'])
-    def _svgd_update(self, particles, raw_grad, h=-1):
+    def _svgd_kernel(self, particles, h=-1):
         '''
-        Standard SVGD drift-minus-repulsion combined update, from the joint RBF kernel.
-
-        particles, raw_grad : (k, dim) -- raw_grad = -self.gradient(particles, data_batch)
-        returns              : (k, dim) combined update, fed to a descent optimizer
+        Compute the SVGD RBF kernel and its gradient term.
+        particles : (k, d)
+        returns   : Kxy (k, k), dxkxy (k, d)
         '''
-        k = particles.shape[0]
-
         L2sq, h = self.pairwise_distance(particles, h)
+        
         Kxy = jnp.exp(-L2sq / h) # (k, k)
         dxkxy = (Kxy.sum(axis=1, keepdims=True) * particles - Kxy @ particles) * (jnp.array(2.0, dtype=particles.dtype) / h) # (k, d)
 
-        return (Kxy @ raw_grad - dxkxy) / k
+        return Kxy, dxkxy
 
-        
-    @partial(jax.jit, static_argnames=['self'])
-    def _reweighted_svgd_update(self, particles, raw_grad, data_batch, h=-1, clip_exponent=20.0):
+    @partial(jax.jit, static_argnames=['self', 'n_kernels', 'ratio'])
+    def _mk_svgd_update(self, particles, raw_grad, n_kernels=5, ratio=2.0):
         '''
-        Local KL Convergence Rate for Stein Variational Gradient Descent with Reweighted Kernel
-        Xunpeng Huang, Hanze Dong, Cong Fang (2023)
-        https://openreview.net/forum?id=k2CRIF8tJ7Y
-        
-        Combined SVGD drift-minus-repulsion update using the density-reweighted kernel
-        k(x,y) = p_*(x)^(-1/2) * k_base(x,y) * p_*(y)^(-1/2) from "Local KL Convergence Rate
-        for Stein Variational Gradient Descent with Reweighted Kernel" (Eq. 24), with k_base
-        the standard RBF kernel from _svgd_update. Reweighting by the target's own (inverse-sqrt)
-        density amplifies the repulsive force in low-density regions, where the standard kernel's
-        corrective gradient vanishes as the current particle density -> 0 -- the mechanism behind
-        SVGD's well-known variance-collapse/ underdispersion tendency.
-
-        Closed-form derivation (product rule through the p_*(x)^(-1/2) factor; s(x) = score =
-        grad log p_*(x)):
-
-            grad_x k(x,y) = k(x,y) * [ grad_x log k_base(x,y) - 0.5*s(x) ]
-                          = k(x,y) * [ -2(x-y)/h - 0.5*s(x) ]
-
-        Substituting into the standard SVGD update phi(x_i) = (1/k) sum_j [k(x_j,x_i)*s(x_j)
-        + grad_{x_j} k(x_j,x_i)] and simplifying shows the density reweighting exactly halves
-        the drift/attraction term's coefficient relative to the repulsion term. Negating to
-        match this codebase's "grad_particles fed to a descent optimizer" convention gives:
-
-            combined = (0.5 * K_new @ raw_grad - dxkxy_new) / k
-
-        where K_new[i,j] = k(x_i,x_j) and dxkxy_new is computed from K_new exactly like
-        _svgd_update's dxkxy. This reduces exactly to _svgd_update's combined formula (up to
-        the permanent 0.5 drift-coefficient difference) when K_new's density-reweighting
-        factor is uniformly 1 (i.e. logdensity is constant across particles).
-
-        Numerical stability (an engineering addition, not specified by the paper):
-        p_*(x)^(-1/2) = exp(-0.5*logdensity(x)) is only meaningful up to logdensity's
-        arbitrary additive constant, and raw logdensity differences across particles can be
-        large -- both terms would overflow directly. logdensity is centered by its per-batch max
-        (so the mode-ish particle gets reweight factor 1 and everything else amplifies, matching
-        the paper's intent to amplify low-density regions) and the pairwise exponent is clipped to
-        `clip_exponent` before exponentiating, bounding the maximum amplification factor at
-        exp(clip_exponent).
+        Multiple Kernel SVGD combined update (Eq. 19+21 in mksvgd.pdf): combine n_kernels RBF
+        kernels at bandwidths geometrically spaced around the usual median-heuristic h0 by
+        factor `ratio`, weighted by each kernel's own empirical KSD magnitude (Eq. 21). See
+        module docstring for the bandwidth-ladder convention and the per-kernel/weight
+        formulas.
 
         particles, raw_grad : (k, dim) -- raw_grad = -self.gradient(particles, data_batch)
-        data_batch          : passed through to self.logdensity, matching self.gradient's convention
-        returns             : (k, dim) combined update
+        n_kernels            : number of RBF bandwidths in the ladder (static)
+        ratio                : geometric spacing between adjacent bandwidths (static)
+        returns               : (k, dim) combined update, in this codebase's
+            "fed to a descent optimizer" convention, i.e. weighted sum of each kernel's own
+            standard _svgd_kernel-style combined update (each already the negative of that
+            kernel's ascent direction phi_i, so no separate negation is needed here -- see
+            _svgd_kernel's docstring/tests for that sign convention).
         '''
         k, dim = particles.shape
-        L2sq, h = self.pairwise_distance(particles, h)
+        score = -raw_grad
 
-        logdensity = jax.vmap(lambda x: self.logdensity(x, data_batch).sum())(particles)  # (k,)
-        ld_centered = logdensity - jnp.max(logdensity)  # <= 0; 0 at the batch's highest-density particle
-        exponent = jnp.clip(-0.5 * (ld_centered[:, None] + ld_centered[None, :]), max=clip_exponent)
-        reweight = jnp.exp(exponent)  # (k, k), >= 1 pairwise density-reweighting factor
+        sq_norms = jnp.sum(particles ** 2, axis=1)
+        with jax.default_matmul_precision("highest"):
+            L2sq = sq_norms[:, None] + sq_norms[None, :] - 2 * particles @ particles.T
+        L2sq = jnp.clip(L2sq, min=0.0)
 
-        K_new = reweight * jnp.exp(-L2sq / h)  # (k, k)
-        dxkxy_new = (K_new.sum(axis=1, keepdims=True) * particles - K_new @ particles) * (jnp.array(2.0, dtype=particles.dtype) / h)
+        _, h0 = self.pairwise_distance(particles, -1)  # median-heuristic anchor, recomputed every call since particles move
 
-        return (0.5 * (K_new @ raw_grad) - dxkxy_new) / k
+        # Score-dependent cross terms, computed once and shared across all n_kernels bandwidths
+        SS = score @ score.T                      # (k,k) score_i . score_j
+        A = score @ particles.T                   # (k,k) score_i . x_j
+        diag_sx = jnp.sum(score * particles, axis=1)  # (k,)
+        cross = diag_sx[:, None] + diag_sx[None, :] - A - A.T  # (score_i-score_j).(x_i-x_j)
+
+        exponents = [i - (n_kernels - 1) / 2.0 for i in range(n_kernels)]  # static, python floats
+
+        combined_list, norms_sq = [], []
+        for e in exponents:
+            h = h0 * (ratio ** e)
+            K = jnp.exp(-L2sq / h)
+            dxkxy = (K.sum(axis=1, keepdims=True) * particles - K @ particles) * (jnp.array(2.0, dtype=particles.dtype) / h)
+            combined_i = (K @ raw_grad - dxkxy) / k  # (k, dim) -- same formula as _svgd_kernel's combined, for this bandwidth alone
+
+            M_i = K * (SS + (2.0 / h) * cross + 2.0 * dim / h - (4.0 / h**2) * L2sq)
+            norm_sq_i = jnp.mean(M_i)  # empirical ||phi_i||_H^2, the KSD U-statistic for kernel i
+
+            combined_list.append(combined_i)
+            norms_sq.append(norm_sq_i)
+
+        combined_stack = jnp.stack(combined_list, axis=0)           # (n_kernels, k, dim)
+        norms = jnp.sqrt(jnp.clip(jnp.stack(norms_sq), min=1e-12))  # (n_kernels,)
+        w = norms / jnp.sqrt(jnp.sum(norms ** 2))                   # Eq. 21, ||w||_2 = 1
+
+        return jnp.einsum('m,mkd->kd', w, combined_stack)
 
 
-    @partial(jax.jit, static_argnames=['self', 'is_MAP', 'k_target'])
-    def _mitotic_split(self, particles, key, is_MAP, k_target):
+    @partial(jax.jit, static_argnames=['self', 'is_MAP', 'k_final'])
+    def _mitotic_split(self, particles, key, is_MAP, k_final):
         '''
-        Expand the particle count from its current size directly to k_target in a single step,
+        Expand the particle count from its current size directly to k_final in a single step,
         using covariance-matched jitter: new offspring are drawn from a multivariate Gaussian
         fit to the current ensemble's own empirical covariance (a smoothed-bootstrap-style
         perturbation). Each existing particle is anchored to the same number of offspring
         (n_new // k), so the split is as even as possible; only the remainder (n_new % k,
-        left over when k_target - k doesn't divide evenly by k) is assigned to a random subset
+        left over when k_final - k doesn't divide evenly by k) is assigned to a random subset
         of parents, chosen without replacement so no parent gets more than one "extra"
-        offspring from the remainder.
-        
-        Jitter scale is calibrated to budget = h/2, where h is the SVGD kernel's median-heuristic
-        bandwidth; this matches the kernel's implicit Gaussian variance (the kernel is exp(-d^2/h),
-        so h = 2*sigma^2 in the usual Gaussian-exponent convention).
+        offspring from the remainder. Jitter scale is calibrated to budget = h/2, where h is
+        the SVGD kernel's median-heuristic bandwidth -- this matches the kernel's own implicit
+        Gaussian variance (the kernel is exp(-d^2/h), so h = 2*sigma^2 in the usual
+        Gaussian-exponent convention).
+
+        This specific method (covariance-matched jitter, single direct jump rather than
+        several intermediate doublings) was chosen after comparing 6 particle-splitting
+        strategies across multiple compute budgets, using less compute by skipping intermediate phases
+        entirely -- a reasonable tradeoff for a simpler, two-phase solve() API.
         '''
         k, dim = particles.shape
-        n_new = k_target - k
+        n_new = k_final - k
 
         if not is_MAP:
             _, h = self.pairwise_distance(particles, -1)
@@ -191,15 +240,14 @@ class MSVGD():
 
         return jnp.concatenate([particles, offspring], axis=0)
 
-    
     @partial(jax.jit, static_argnames=[
         'self', 'optimizer', 'opt_kwargs_keys', 'is_MAP', 'batch_size',
-        'grad_clip_enabled', 'monitor_enabled', 'reweighted_kernel',
+        'grad_clip_enabled', 'monitor_enabled',
     ])
     def _run_phase(
         self, particles, data, key,
         opt_kwargs_values, grad_clip_value, atol, rtol, bandwidth, max_iter, phase, monitor_interval, *,
-        optimizer, opt_kwargs_keys, is_MAP, batch_size, grad_clip_enabled, monitor_enabled, reweighted_kernel,
+        optimizer, opt_kwargs_keys, is_MAP, batch_size, grad_clip_enabled, monitor_enabled,
     ):
         '''
         Run gradient descent (with optional SVGD kernel / batching) to convergence or max_iter,
@@ -213,8 +261,11 @@ class MSVGD():
         executable instead of retracing. `phase` only feeds a jax.debug.print label and
         `monitor_interval` only feeds a traced modulo check, so neither needs to be static --
         only whether monitoring is enabled at all (`monitor_enabled`) changes which code path
-        gets compiled in.
+        gets compiled in. For an example of this use-case, see the annealing in the ring mixure
+        example in tests.ipynb.
         '''
+        k = particles.shape[0]
+
         opt = optimizer(**dict(zip(opt_kwargs_keys, opt_kwargs_values)))
         if grad_clip_enabled:
             opt = optax.chain(optax.clip_by_global_norm(grad_clip_value), opt)
@@ -258,12 +309,9 @@ class MSVGD():
             # Logdensity gradient computation
             grad_particles = -self.gradient(particles, data_batch)
 
-            # Compute SVGD gradient direction
+            # Compute multiple-kernel SVGD gradient direction
             if not is_MAP:
-                if reweighted_kernel:
-                    grad_particles = self._reweighted_svgd_update(particles, grad_particles, data_batch, h=bandwidth)
-                else:
-                    grad_particles = self._svgd_update(particles, grad_particles, h=bandwidth)
+                grad_particles = self._mk_svgd_update(particles, grad_particles)
 
             # Print max grad every `monitor_interval` iterations (no output when monitoring disabled)
             if monitor_enabled:
@@ -298,14 +346,12 @@ class MSVGD():
         )
         return particles, grad_particles, n_iter
 
-        
     def solve(
         self,
         x0,
-        k_schedule=None,
+        k_final=None,
         random_seed=8,
         data=None,
-        monitor_convergence=0,
         optimizer=optax.adam,
         optimizer_kwargs={"learning_rate": 0.1},
         batch_size=None,
@@ -315,7 +361,7 @@ class MSVGD():
         rtol=1e-8,
         bandwidth=-1,
         grad_clip=None,
-        reweighted_kernel=False,
+        monitor_convergence=0
     ):
         '''
         Solve mSVGD optimization.
@@ -323,26 +369,20 @@ class MSVGD():
         Arguments
         ----------
         x0                  : array-like, initial particles (k, d)
-        k_schedule          : int, list of ints, or None (default). If None, no particle-count
-            growth happens. If an int, behaves as a single split: runs one phase at len(x0) particles,
-            then a single covariance-matched split directly to k_schedule particles, then a second
-            phase at k_schedule particles.\
-            
-            If a list, it must be strictly increasing (each entry greater than the previous, and
-            the first greater than len(x0)): runs one phase at len(x0) particles, then a direct-jump 
-            split to k_schedule[0], then a phase at k_schedule[0] particles, then a split to
-            k_schedule[1], and so on -- len(k_schedule) splits and len(k_schedule)+1 phases in total.
-        random_seed         : int used to set jax.random key for sampling the mitotic splits
+        k_final             : int or None (default). If None, no particle-count growth happens
+            -- the whole optimization runs at the len(x0) particles given. If set (must be >
+            len(x0)), runs one phase at len(x0) particles, then a single covariance-matched
+            split directly to k_final particles (see _mitotic_split), then a second phase at
+            k_final particles. A single direct jump is simpler and ~1.7x cheaper than growing
+            through several smaller doublings, at a modest coverage cost (measured 44% vs. 47%
+            joint coverage on a real inference problem) -- see mitotic_split_variants.py for
+            the comparison and the other splitting strategies considered.
+        random_seed         : int used to set jax.random key for sampling the mitotic split
         data                : override data stored at class initialization
-        monitor_convergence : int — print max grad every N iterations
-            (0 = print status after each phase, < 0 = fully silence)
-            
-        ----------
-        Note: The following arguments may each be passed as a single value to be used for
-            every phase, or as a list of length n_phases (one value per phase), where
-            n_phases = 1 if k_schedule is None, else len(k_schedule)+1 (or 2 if k_schedule is
-            a plain int) -- a list of the wrong length is an error.
-            
+
+        Note: The following arguments may each be passed as a single value to be used for both
+            phases, or as a list of length 2 (one value per phase) if k_final is set -- a
+            length-2 list when k_final is None is an error, since there's only one phase.
         optimizer           : an optax optimizer constructor, or list thereof, configured for descent
         optimizer_kwargs    : dict of kwargs passed to the optimizer, or list thereof
             Warning : It is necessary in some case for optimizer kwargs to have the same dtype as x0,
@@ -355,36 +395,21 @@ class MSVGD():
         grad_clip           : float or list of floats (one per phase), max global norm for the particle
             gradient before the optimizer step, None to disable. Useful to guard against exploding
             updates in batched/stochastic optimization.
-        reweighted_kernel   : bool or list of bools (one per phase). If True, use the
-            density-reweighted SVGD kernel (from Huang, Dong, Fang [2023]) instead of the standard
-            joint RBF kernel. This amplifies the repulsive force in low-density regions, which counteracts
-            SVGD's typical variance-collapse/underdispersion. Found to give the best credible-interval calibration
-            of several corrective techniques tried on a real, high dimensional ODE-inference benchmark.
-            No effect when is_MAP is True (no kernel is used for MAP estimation).
-        
+
+        monitor_convergence : int — print max grad every N iterations
+            (0 = print status after each phase, < 0 = fully silence)
         '''
         if isinstance(random_seed, int):
             key = jr.key(random_seed)
         else: key = random_seed
 
-        if k_schedule is None:
-            k_schedule = []
-        elif isinstance(k_schedule, int):
-            k_schedule = [k_schedule]
-        else:
-            k_schedule = list(k_schedule)
+        if k_final is not None and k_final <= x0.shape[0]:
+            raise ValueError(
+                f"k_final ({k_final}) must be greater than the starting particle count "
+                f"({x0.shape[0]}); mSVGD only grows the particle count, it doesn't shrink it."
+            )
 
-        prev_k = x0.shape[0]
-        for split_i, k_target in enumerate(k_schedule):
-            if k_target <= prev_k:
-                raise ValueError(
-                    f"k_schedule must be strictly increasing and greater than the starting "
-                    f"particle count ({x0.shape[0]}); mSVGD only grows the particle count, it "
-                    f"doesn't shrink it. Got k_schedule[{split_i}]={k_target}, expected > {prev_k}."
-                )
-            prev_k = k_target
-
-        n_phases = len(k_schedule) + 1
+        n_phases = 1 if k_final is None else 2
 
         optimizer        = _listify(optimizer, n_phases)
         optimizer_kwargs = _listify(optimizer_kwargs, n_phases)
@@ -395,7 +420,6 @@ class MSVGD():
         rtol             = _listify(rtol, n_phases, x0.dtype)
         bandwidth        = _listify(bandwidth, n_phases, x0.dtype)
         grad_clip        = _listify(grad_clip, n_phases)
-        reweighted_kernel = _listify(reweighted_kernel, n_phases)
 
         monitor_enabled = monitor_convergence > 0
         # only matters when monitor_enabled is False, in which case the value is inert
@@ -442,16 +466,15 @@ class MSVGD():
                 batch_size=batch_size_i,
                 grad_clip_enabled=grad_clip_enabled,
                 monitor_enabled=monitor_enabled,
-                reweighted_kernel=bool(reweighted_kernel[i]),
             )
 
             if monitor_convergence >= 0:
                 max_grad = float(jnp.abs(grad_particles).max())
                 print(f"Split {i} finished after {int(n_iter)} iterations | max grad = {max_grad:.5f}")
 
-            # A direct-jump split after every phase except the last, per k_schedule
-            if i < len(k_schedule):
-                particles = self._mitotic_split(particles, key_mitosis, is_MAP_i, k_schedule[i])
+            # Single direct split to k_final, after the first (and only the first) phase
+            if i == 0 and k_final is not None:
+                particles = self._mitotic_split(particles, key_mitosis, is_MAP_i, k_final)
 
         self.particles = particles.copy()
         return particles
