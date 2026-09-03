@@ -1,3 +1,51 @@
+"""
+Mitosis-SVGD: Stein variational gradient descent with a growing particle count.
+
+Read this before using it for posterior uncertainty
+---------------------------------------------------
+SVGD's equilibrium ensemble is UNDERDISPERSED in high dimensions, and the deficit is a property
+of the algorithm rather than of the optimisation. Ba, Erdogdu, Ghassemi, Sun, Suzuki, Wu & Zhang,
+"Understanding the Variance Collapse of SVGD in High Dimensions" (ICLR 2022, OpenReview
+Qycd9j5Qp9J) prove for an isotropic Gaussian target under the plain median heuristic that
+
+    Var_SVGD / Var_target = (e - 1)^-1 K / d = 0.582 K / d       (their Corollary 4)
+
+so at K < d the ensemble is too narrow in proportion to K/d. Started at EXACT draws from the
+target it moves away from them, which rules out any initialisation strategy. The three tools
+below exist because of that; `min_particles`, `h_star` and `rescale_stein` are all it takes to
+avoid the trap, and `stein_R` is how you notice you are in it.
+
+  * The bandwidth is the plain median, NOT median/log(K). See pairwise_distance -- the log
+    costs a factor of 0.582 K / ln K, and it changes the particle requirement's growth rate,
+    not just its constant. Measured on isotropic Gaussians, particles needed to reach 90% of
+    the correct variance:
+
+        dimension      2    3    4    5    6    7    8
+        h = Med/lnK   96  192  512 2048 4096    -    -
+        h = Med       16   24   32   48   64   64   96
+
+  * `stein_R` reports the Stein-identity dispersion ratio, which tends to 1 under the target and
+    below 1 when underdispersed. It is the only cheap diagnostic that sees this failure: the
+    optimiser's own convergence test cannot, because the ensemble does converge -- to the wrong
+    spread. It is printed alongside max grad and left on self.stein_R.
+
+  * A large FIXED `bandwidth` removes the feedback loop that drives the collapse (the median
+    heuristic measures h from the ensemble, so contraction tightens h, which permits more
+    contraction). `h_star` gives the natural scale; 10x it works. This needs a small fixed step
+    size -- adaptive optimisers such as Prodigy are unstable in that regime.
+
+  * `rescale_stein` applies the one-number correction that a fixed bandwidth leaves behind. With
+    the collapse converted from a shape error to a scale error, dividing the deviations from the
+    ensemble mean by sqrt(R) corrects it, with no reference and no extra gradient evaluations.
+
+What none of this fixes
+-----------------------
+On a target that is not Gaussian, SVGD's fixed point is displaced from the posterior mean along
+the axis joining the mode to the mean, by a fraction of that axis's length. It vanishes on an
+exact Gaussian and it is not removable by bandwidth, metric, step size or particle count at any
+budget we could reach. If the quantity you want is a posterior MEAN of a non-Gaussian target,
+use something else; if you want a well-dispersed ensemble, the recipe above delivers one.
+"""
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -8,6 +56,7 @@ import numpy as np
 from functools import partial
 from collections.abc import Iterable
 import inspect
+import warnings
 
 def _listify(val, length, dtype=None):
     """Broadcast a hyperparameter to one value per phase. Helper -- not user-facing."""
@@ -60,6 +109,91 @@ class MSVGD():
             return jax.grad(lambda x: self.logdensity(x, data_batch).sum())(x)
         self.gradient = jax.jit(jax.vmap(_single_grad, in_axes=(0, None)))
         
+    # ------------------------------------------------------------------ sizing and diagnostics
+    @staticmethod
+    def min_particles(dim, level=0.9):
+        """
+        Particles needed for the equilibrium ensemble to reach `level` of the correct variance.
+
+        Measured on isotropic N(0, I_dim), Adam at 0.05, 4000 iterations, started at exact draws;
+        `investigation8/exp06b_Kcrit_nolog.py` in the companion repository. Fitted over
+        dim = 2..8:
+
+            level 0.8:  K = 8.5 exp(0.132 dim)
+            level 0.9:  K = 10.0 exp(0.287 dim)
+
+        reproducing the measured critical counts to within one rung of the sweep. Exponential in
+        the dimension, but slowly -- 1.33x per dimension at level 0.9, against 2.68x under the
+        median/log(K) bandwidth this code used to use.
+
+        Optimistic for real targets. It is derived on isotropic Gaussians, and anisotropy makes
+        matters worse: on three ODE posteriors at dim = 306..608 an ensemble of 400 sat 34-48x
+        its Monte Carlo floor under either bandwidth rule. Treat it as a lower bound, use
+        stein_R to check, and prefer a fixed `bandwidth` with rescale_stein when dim is large.
+        """
+        if dim > 12:
+            warnings.warn(
+                f"min_particles({dim}) extrapolates an exponential fit made over dim = 2..8 "
+                f"by a wide margin. Its message -- far more particles than you have -- is "
+                f"reliable; its value is not, and should not be quoted as a measurement.",
+                stacklevel=2)
+        a, b = (8.5, 0.132) if level <= 0.85 else (10.0, 0.287)
+        return int(np.ceil(a * np.exp(b * dim)))
+
+    @staticmethod
+    def h_star(k, dim):
+        """
+        Natural scale for a FIXED bandwidth: h* = 2 dim / ln k.
+
+        This is the bandwidth at which the adaptive median heuristic comes to rest, so it is the
+        scale a fixed choice should be measured against rather than a recommendation in itself.
+        A fixed bandwidth of about 10 h* was the smallest that gave a correctly-dispersed
+        attractor on the problems tested; larger values work too and simply take longer to reach
+        it, since the trajectory depends on bandwidth x iterations. Requires a small fixed step.
+        """
+        return 2.0 * dim / np.log(k)
+
+    def stein_R(self, particles=None, data=None):
+        """
+        Stein-identity dispersion ratio of an ensemble. 1 = correctly dispersed, < 1 too narrow.
+
+        Public wrapper over _stein_R that supplies the score itself. Defaults to the ensemble and
+        data held on the object, so `m.solve(...); m.stein_R()` is the usual call.
+        """
+        x = self.particles if particles is None else jnp.asarray(particles)
+        if x is None:
+            raise ValueError("no particles: pass them explicitly or call solve() first")
+        d = self.data if data is None else data
+        return float(self._stein_R(x, -self.gradient(x, d)))
+
+    def rescale_stein(self, particles=None, data=None):
+        """
+        Correct a uniform dispersion deficit by rescaling about the ensemble mean by 1/sqrt(R).
+
+        For a Gaussian target and an ensemble of covariance A, R = tr(A Sigma^-1)/dim, so an
+        ensemble uniformly a factor c too narrow in variance reads R = c and dividing its
+        deviations by sqrt(R) restores the spread. No reference, no tuning, no extra gradient
+        evaluations beyond the one that measures R.
+
+        This corrects a SCALE and only a scale. It is worth doing when the collapse is uniform
+        across directions, which is what a fixed `bandwidth` in whitened coordinates produces;
+        under the adaptive bandwidth the deficit is anisotropic and rescaling will inflate the
+        already-adequate directions to fix the deficient ones. It cannot touch an error in the
+        ensemble MEAN -- it is applied about that mean.
+
+        Measured with a fixed bandwidth in whitened coordinates on three ODE posteriors: energy
+        distance to the reference went from 2.4-6.8x its Monte Carlo floor to 0.57-0.96x.
+
+        returns : (rescaled particles, R measured before rescaling)
+        """
+        x = self.particles if particles is None else jnp.asarray(particles)
+        if x is None:
+            raise ValueError("no particles: pass them explicitly or call solve() first")
+        d = self.data if data is None else data
+        R = self._stein_R(x, -self.gradient(x, d))
+        mu = x.mean(axis=0, keepdims=True)
+        return mu + (x - mu) / jnp.sqrt(jnp.clip(R, min=1e-12)), float(R)
+
     @staticmethod
     def _stein_R(particles, raw_grad):
         '''
@@ -288,7 +422,11 @@ class MSVGD():
         is_MAP              : bool, mode-find on the logdensity gradient alone (no SVGD kernel)
         max_iter            : int, iteration cap for the phase
         atol, rtol          : convergence tolerances,  all(grad <= atol + rtol * particles)
-        bandwidth           : RBF bandwidth (-1 = median heuristic)
+        bandwidth           : RBF bandwidth. -1 uses the plain median heuristic, which is
+            adaptive and collapses the ensemble variance in high dimensions (see the module
+            docstring). A large FIXED value removes that: see h_star for the scale, use about
+            10x it, pair it with a small fixed step rather than an adaptive optimizer, and
+            finish with rescale_stein.
         grad_clip           : float, max global norm for the particle gradient before the
             optimizer step, None to disable. Guards against exploding updates in
             batched/stochastic optimization.
