@@ -153,12 +153,14 @@ class MSVGD():
         """
         return 2.0 * dim / np.log(k)
 
-    def stein_R(self, particles=None, data=None):
+    def stein_ratio(self, particles=None, data=None):
         """
         Stein-identity dispersion ratio of an ensemble. 1 = correctly dispersed, < 1 too narrow.
 
         Public wrapper over _stein_R that supplies the score itself. Defaults to the ensemble and
-        data held on the object, so `m.solve(...); m.stein_R()` is the usual call.
+        data held on the object, so `m.solve(...); m.stein_ratio()` is the usual call. Named
+        distinctly from the `stein_R` attribute that solve() leaves behind, which is this same
+        quantity evaluated on the returned ensemble.
         """
         x = self.particles if particles is None else jnp.asarray(particles)
         if x is None:
@@ -406,9 +408,9 @@ class MSVGD():
         random_seed         : int used to set jax.random key for sampling the mitotic splits
         data                : override data stored at class initialization
         monitor_convergence : int — print max grad and the Stein-identity dispersion diagnostic
-            (see _stein_R; -> 1 under the target, < 1 underdispersed) every N iterations
+            (see stein_ratio; -> 1 under the target, < 1 underdispersed) every N iterations
             (0 = print status after each phase, < 0 = fully silence). The diagnostic is also
-            left on self.stein_R regardless.
+            left on self.stein_R regardless, evaluated on the returned ensemble.
 
         ----------
         Note: each argument below takes either one value used for every phase, or a list of
@@ -489,5 +491,7 @@ class MSVGD():
                 particles = self._mitotic_split(particles, key_mitosis, is_MAP_i, k_schedule[i])
 
         self.particles = particles.copy()
-        self.stein_R = float(stein_R)
+        # Recomputed rather than taken from the loop, which reports the ratio at the positions
+        # BEFORE its final update -- one step stale, and confusing next to stein_ratio().
+        self.stein_R = self.stein_ratio()
         return self.particles
