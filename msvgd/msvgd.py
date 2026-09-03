@@ -219,7 +219,17 @@ class MSVGD():
         '''
         return jnp.sum((particles - particles.mean(axis=0)) * raw_grad) / particles.size
         
-    def pairwise_distance(self, particles, h=-1):
+    def pairwise_distance(self, particles, h=-1, adaptive=None):
+        """
+        (squared pairwise distances, bandwidth).
+
+        adaptive : whether to compute the median heuristic. None infers it from h when h is a
+            concrete number. Pass it explicitly (a Python bool, static under jit) when h is a
+            traced value: otherwise `jnp.where(h <= 0, median, h)` has to evaluate BOTH branches,
+            and the median is a sort over k(k-1)/2 entries that is then discarded. That is about
+            a quarter of the cost of an SVGD step at k = 400, paid on every iteration of a run
+            that uses a fixed bandwidth -- which is the configuration worth using.
+        """
         k = particles.shape[0]
         sq_norms = jnp.sum(particles ** 2, axis=1) # (k,)
         # "highest" precision avoids catastrophic cancellation in this sum-of-squares expansion
@@ -250,19 +260,23 @@ class MSVGD():
         # NOT a fix -- both variants leave the ensemble 34-48x its Monte-Carlo floor at these
         # dimensions. The bandwidth that matters is a large FIXED one; see the `bandwidth`
         # argument to solve().
+        if adaptive is None:
+            adaptive = not (isinstance(h, (int, float)) and h > 0)
+        if not adaptive:
+            return L2sq, jnp.asarray(h, particles.dtype)
         upper_tri = np.triu_indices(k, k=1) # upper triangle, excluding diagonal
         median = jnp.median(jnp.clip(L2sq[upper_tri], min=jnp.array(1e-6, dtype=particles.dtype)))
         return L2sq, jnp.where(h <= 0, median, h) # (1,)
 
-    @partial(jax.jit, static_argnames=['self'])
-    def _svgd_update(self, particles, raw_grad, h=-1):
+    @partial(jax.jit, static_argnames=['self', 'adaptive'])
+    def _svgd_update(self, particles, raw_grad, h=-1, adaptive=None):
         '''
         Standard SVGD drift-minus-repulsion update, from the joint RBF kernel.
 
         raw_grad : (k, dim) -- raw_grad = -self.gradient(particles, data_batch)
         returns  : (k, dim) combined update, fed to a descent optimizer
         '''
-        L2sq, h = self.pairwise_distance(particles, h)
+        L2sq, h = self.pairwise_distance(particles, h, adaptive)
 
         k = particles.shape[0]
         Kxy = jnp.exp(-L2sq / h)
@@ -302,11 +316,12 @@ class MSVGD():
 
     @partial(jax.jit, static_argnames=[
         'self', 'optimizer', 'opt_kwargs_keys', 'is_MAP', 'batch_size',
-        'grad_clip_enabled', 'monitor_enabled'])
+        'grad_clip_enabled', 'monitor_enabled', 'adaptive_bandwidth'])
     def _run_phase(
         self, particles, data, key, *,
         opt_kwargs_values, grad_clip_value, atol, rtol, bandwidth, max_iter, phase, monitor_interval,
         optimizer, opt_kwargs_keys, is_MAP, batch_size, grad_clip_enabled, monitor_enabled,
+        adaptive_bandwidth,
     ):
         '''
         Run gradient descent (with optional SVGD kernel / batching) to convergence or max_iter,
@@ -351,7 +366,8 @@ class MSVGD():
             stein_R = self._stein_R(particles, grad_particles)
 
             if not is_MAP:
-                grad_particles = self._svgd_update(particles, grad_particles, h=bandwidth)
+                grad_particles = self._svgd_update(particles, grad_particles, h=bandwidth,
+                                                   adaptive=adaptive_bandwidth)
 
             if monitor_enabled:
                 jax.lax.cond(
@@ -447,7 +463,8 @@ class MSVGD():
         max_iter          = _listify(max_iter, n_phases)
         atol              = _listify(atol, n_phases, particles.dtype)
         rtol              = _listify(rtol, n_phases, particles.dtype)
-        bandwidth         = _listify(bandwidth, n_phases, particles.dtype)
+        bandwidth_static  = _listify(bandwidth, n_phases)          # Python values, for the
+        bandwidth         = _listify(bandwidth, n_phases, particles.dtype)   # static branch
         grad_clip         = _listify(grad_clip, n_phases)
 
         monitor_enabled = monitor_convergence > 0
@@ -478,7 +495,8 @@ class MSVGD():
                 phase=i, monitor_interval=monitor_interval,
                 optimizer=optimizer[i], opt_kwargs_keys=opt_keys, is_MAP=is_MAP_i,
                 batch_size=batch_size[i], grad_clip_enabled=clip_on,
-                monitor_enabled=monitor_enabled
+                monitor_enabled=monitor_enabled,
+                adaptive_bandwidth=bool(bandwidth_static[i] <= 0),
             )
 
             if monitor_convergence >= 0:
