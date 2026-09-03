@@ -219,6 +219,7 @@ class MSVGD():
         '''
         return jnp.sum((particles - particles.mean(axis=0)) * raw_grad) / particles.size
         
+<<<<<<< HEAD
     def pairwise_distance(self, particles, h=-1, adaptive=None):
         """
         (squared pairwise distances, bandwidth).
@@ -230,6 +231,9 @@ class MSVGD():
             a quarter of the cost of an SVGD step at k = 400, paid on every iteration of a run
             that uses a fixed bandwidth -- which is the configuration worth using.
         """
+=======
+    def pairwise_distance(self, particles, h=-1):
+>>>>>>> 6937ea5578692c246f80aeccd0e84a165af87466
         k = particles.shape[0]
         sq_norms = jnp.sum(particles ** 2, axis=1) # (k,)
         # "highest" precision avoids catastrophic cancellation in this sum-of-squares expansion
@@ -260,23 +264,35 @@ class MSVGD():
         # NOT a fix -- both variants leave the ensemble 34-48x its Monte-Carlo floor at these
         # dimensions. The bandwidth that matters is a large FIXED one; see the `bandwidth`
         # argument to solve().
+<<<<<<< HEAD
         if adaptive is None:
             adaptive = not (isinstance(h, (int, float)) and h > 0)
         if not adaptive:
             return L2sq, jnp.asarray(h, particles.dtype)
+=======
+>>>>>>> 6937ea5578692c246f80aeccd0e84a165af87466
         upper_tri = np.triu_indices(k, k=1) # upper triangle, excluding diagonal
         median = jnp.median(jnp.clip(L2sq[upper_tri], min=jnp.array(1e-6, dtype=particles.dtype)))
         return L2sq, jnp.where(h <= 0, median, h) # (1,)
 
+<<<<<<< HEAD
     @partial(jax.jit, static_argnames=['self', 'adaptive'])
     def _svgd_update(self, particles, raw_grad, h=-1, adaptive=None):
+=======
+    @partial(jax.jit, static_argnames=['self'])
+    def _svgd_update(self, particles, raw_grad, h=-1):
+>>>>>>> 6937ea5578692c246f80aeccd0e84a165af87466
         '''
         Standard SVGD drift-minus-repulsion update, from the joint RBF kernel.
 
         raw_grad : (k, dim) -- raw_grad = -self.gradient(particles, data_batch)
         returns  : (k, dim) combined update, fed to a descent optimizer
         '''
+<<<<<<< HEAD
         L2sq, h = self.pairwise_distance(particles, h, adaptive)
+=======
+        L2sq, h = self.pairwise_distance(particles, h)
+>>>>>>> 6937ea5578692c246f80aeccd0e84a165af87466
 
         k = particles.shape[0]
         Kxy = jnp.exp(-L2sq / h)
@@ -316,12 +332,19 @@ class MSVGD():
 
     @partial(jax.jit, static_argnames=[
         'self', 'optimizer', 'opt_kwargs_keys', 'is_MAP', 'batch_size',
+<<<<<<< HEAD
         'grad_clip_enabled', 'monitor_enabled', 'adaptive_bandwidth'])
+=======
+        'grad_clip_enabled', 'monitor_enabled'])
+>>>>>>> 6937ea5578692c246f80aeccd0e84a165af87466
     def _run_phase(
         self, particles, data, key, *,
         opt_kwargs_values, grad_clip_value, atol, rtol, bandwidth, max_iter, phase, monitor_interval,
         optimizer, opt_kwargs_keys, is_MAP, batch_size, grad_clip_enabled, monitor_enabled,
+<<<<<<< HEAD
         adaptive_bandwidth,
+=======
+>>>>>>> 6937ea5578692c246f80aeccd0e84a165af87466
     ):
         '''
         Run gradient descent (with optional SVGD kernel / batching) to convergence or max_iter,
@@ -366,8 +389,12 @@ class MSVGD():
             stein_R = self._stein_R(particles, grad_particles)
 
             if not is_MAP:
+<<<<<<< HEAD
                 grad_particles = self._svgd_update(particles, grad_particles, h=bandwidth,
                                                    adaptive=adaptive_bandwidth)
+=======
+                grad_particles = self._svgd_update(particles, grad_particles, h=bandwidth)
+>>>>>>> 6937ea5578692c246f80aeccd0e84a165af87466
 
             if monitor_enabled:
                 jax.lax.cond(
@@ -463,8 +490,12 @@ class MSVGD():
         max_iter          = _listify(max_iter, n_phases)
         atol              = _listify(atol, n_phases, particles.dtype)
         rtol              = _listify(rtol, n_phases, particles.dtype)
+<<<<<<< HEAD
         bandwidth_static  = _listify(bandwidth, n_phases)          # Python values, for the
         bandwidth         = _listify(bandwidth, n_phases, particles.dtype)   # static branch
+=======
+        bandwidth         = _listify(bandwidth, n_phases, particles.dtype)
+>>>>>>> 6937ea5578692c246f80aeccd0e84a165af87466
         grad_clip         = _listify(grad_clip, n_phases)
 
         monitor_enabled = monitor_convergence > 0
@@ -495,8 +526,12 @@ class MSVGD():
                 phase=i, monitor_interval=monitor_interval,
                 optimizer=optimizer[i], opt_kwargs_keys=opt_keys, is_MAP=is_MAP_i,
                 batch_size=batch_size[i], grad_clip_enabled=clip_on,
+<<<<<<< HEAD
                 monitor_enabled=monitor_enabled,
                 adaptive_bandwidth=bool(bandwidth_static[i] <= 0),
+=======
+                monitor_enabled=monitor_enabled
+>>>>>>> 6937ea5578692c246f80aeccd0e84a165af87466
             )
 
             if monitor_convergence >= 0:
