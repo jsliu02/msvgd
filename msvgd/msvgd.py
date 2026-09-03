@@ -127,80 +127,11 @@ class MSVGD():
         returns  : (k, dim) combined update, fed to a descent optimizer
         '''
         L2sq, h = self.pairwise_distance(particles, h)
-        return self._combine(particles, raw_grad, jnp.exp(-L2sq / h), h, drift=1.0)
 
-    @staticmethod
-    def _combine(particles, raw_grad, K, h, drift):
-        '''
-        Assemble a drift-minus-repulsion update from a kernel matrix K and its bandwidth h.
-
-        K       : (k, k) kernel matrix
-        drift   : coefficient on the attraction term (see _reweighted_svgd_update)
-        returns : (k, dim) combined update, fed to a descent optimizer
-        '''
         k = particles.shape[0]
-        dxkxy = (K.sum(axis=1, keepdims=True) * particles - K @ particles) * (2.0 / h) # (k, dim)
-        return (drift * (K @ raw_grad) - dxkxy) / k
-
-    @partial(jax.jit, static_argnames=['self'])
-    def _svgd_update(self, particles, raw_grad, h=-1):
-        '''
-        Standard SVGD drift-minus-repulsion update, from the joint RBF kernel.
-
-        raw_grad : (k, dim) -- raw_grad = -self.gradient(particles, data_batch)
-        returns  : (k, dim) combined update, fed to a descent optimizer
-        '''
-        L2sq, h = self.pairwise_distance(particles, h)
-        return self._combine(particles, raw_grad, jnp.exp(-L2sq / h), h, drift=1.0)
-
-    @partial(jax.jit, static_argnames=['self'])
-    def _reweighted_svgd_update(self, particles, raw_grad, data_batch, h=-1, clip_exponent=20.0):
-        '''
-        Local KL Convergence Rate for Stein Variational Gradient Descent with Reweighted Kernel
-        Xunpeng Huang, Hanze Dong, Cong Fang (2023)
-        https://openreview.net/forum?id=k2CRIF8tJ7Y
-
-        Drift-minus-repulsion update under the density-reweighted kernel (Eq. 24)
-        k(x,y) = p_*(x)^(-1/2) * k_base(x,y) * p_*(y)^(-1/2), k_base being _svgd_update's RBF
-        kernel. Reweighting by the target's inverse-sqrt density amplifies repulsion in
-        low-density regions, where the standard kernel's corrective gradient vanishes as the
-        particle density -> 0 -- the mechanism behind SVGD's variance-collapse/underdispersion.
-
-        The product rule on the p_*(x)^(-1/2) factor, with s(x) = grad log p_*(x), gives
-
-            grad_x k(x,y) = k(x,y) * [grad_x log k_base(x,y) - 0.5*s(x)]
-                          = k(x,y) * [-2(x-y)/h - 0.5*s(x)]
-
-        so substituting into phi(x_i) = (1/k) sum_j [k(x_j,x_i)*s(x_j) + grad_{x_j} k(x_j,x_i)]
-        leaves the repulsion term as _svgd_update's and exactly halves the drift coefficient --
-        hence drift=0.5 below rather than 1.0.
-
-        Two engineering additions, neither from the paper. First, exp(-0.5*logdensity(x)) is
-        defined only up to logdensity's arbitrary additive constant and would overflow outright,
-        so logdensity is centered by its per-batch max (densest particle gets factor 1, the rest
-        amplify, matching the paper's intent) and the pairwise exponent clipped to
-        `clip_exponent`. Second, that centering leaves every factor >= 1, routinely by orders of
-        magnitude in high dimensions, so the update's magnitude is not comparable to
-        _svgd_update's and a shared atol/rtol would be meaningless. The update is therefore
-        returned UNCHANGED alongside the reweight matrix's batch mean as `scale`, which the
-        caller divides by for monitoring/atol only -- never for the optimizer step, keeping the
-        rescaling exactly invisible to the trajectory for any optimizer.
-
-        NOTE: in high dimensions this kernel needs an Adam-style optimizer; failing that,
-        aggressive gradient clipping may mitigate the issue.
-
-        raw_grad   : (k, dim) -- raw_grad = -self.gradient(particles, data_batch)
-        data_batch : passed to self.logdensity, matching self.gradient's convention
-        returns    : ((k, dim) combined update, scalar scale for monitoring/atol only)
-        '''
-        L2sq, h = self.pairwise_distance(particles, h)
-
-        logdensity = jax.vmap(lambda x: self.logdensity(x, data_batch).sum())(particles) # (k,)
-        ld = logdensity - jnp.max(logdensity) # <= 0; 0 at the batch's highest-density particle
-        reweight = jnp.exp(jnp.clip(-0.5 * (ld[:, None] + ld[None, :]), max=clip_exponent)) # (k, k), >= 1
-
-        combined = self._combine(particles, raw_grad, reweight * jnp.exp(-L2sq / h), h, drift=0.5)
-        return combined, jnp.mean(reweight)
+        Kxy = jnp.exp(-L2sq / h)
+        dxkxy = (Kxy.sum(axis=1, keepdims=True) * particles - Kxy @ particles) * (2.0 / h) # (k, dim)
+        return (Kxy @ raw_grad - dxkxy) / k
 
     @partial(jax.jit, static_argnames=['self', 'is_MAP', 'k_target'])
     def _mitotic_split(self, particles, key, is_MAP, k_target):
@@ -235,12 +166,11 @@ class MSVGD():
 
     @partial(jax.jit, static_argnames=[
         'self', 'optimizer', 'opt_kwargs_keys', 'is_MAP', 'batch_size',
-        'grad_clip_enabled', 'monitor_enabled', 'reweighted_kernel'])
+        'grad_clip_enabled', 'monitor_enabled'])
     def _run_phase(
         self, particles, data, key, *,
         opt_kwargs_values, grad_clip_value, atol, rtol, bandwidth, max_iter, phase, monitor_interval,
         optimizer, opt_kwargs_keys, is_MAP, batch_size, grad_clip_enabled, monitor_enabled,
-        reweighted_kernel,
     ):
         '''
         Run gradient descent (with optional SVGD kernel / batching) to convergence or max_iter,
@@ -284,42 +214,32 @@ class MSVGD():
             # read off the raw score, before any kernel rescales it
             stein_R = self._stein_R(particles, grad_particles)
 
-            # monitor_grad is what atol/rtol check and what gets printed. The reweighted kernel's
-            # update carries its own typical magnitude, so it is divided out for monitoring only
-            # -- never for the optimizer step -- and one atol/rtol then suits either kernel.
-            if is_MAP:
-                monitor_grad = grad_particles
-            elif reweighted_kernel:
-                grad_particles, scale = self._reweighted_svgd_update(
-                    particles, grad_particles, data_batch, h=bandwidth)
-                monitor_grad = grad_particles / scale
-            else:
+            if not is_MAP:
                 grad_particles = self._svgd_update(particles, grad_particles, h=bandwidth)
-                monitor_grad = grad_particles
 
             if monitor_enabled:
                 jax.lax.cond(
                     iteration % monitor_interval == 0,
                     lambda: jax.debug.print("  Split {i} | Iter {it} | Max grad = {m:.5f} | Stein R = {r:.4f}",
-                                            i=phase, it=iteration, m=jnp.abs(monitor_grad).max(), r=stein_R),
+                                            i=phase, it=iteration, m=jnp.abs(grad_particles).max(), r=stein_R),
                     lambda: None,
                 )
 
             updates, opt_state = jax.vmap(opt.update)(grad_particles, opt_state, particles)
             particles = optax.apply_updates(particles, updates)
-            return (particles, opt_state, monitor_grad, stein_R, iteration + 1, key, data_shuffled)
+            return (particles, opt_state, grad_particles, stein_R, iteration + 1, key, data_shuffled)
 
         def cond_fn(carry):
-            particles, _, monitor_grad, _, iteration, _, _ = carry
-            converged = jnp.all(jnp.abs(monitor_grad) <= atol + rtol * jnp.abs(particles))
+            particles, _, grad_particles, _, iteration, _, _ = carry
+            converged = jnp.all(jnp.abs(grad_particles) <= atol + rtol * jnp.abs(particles))
             return ~converged & (iteration < max_iter)
 
         # Seed grad with inf so the convergence check always runs at least one step
         init_carry = (particles, opt_state, jnp.full_like(particles, jnp.inf),
                       jnp.zeros((), particles.dtype),
                       jnp.zeros((), jnp.int32), key, data if batch_size is not None else None)
-        particles, _, monitor_grad, stein_R, n_iter, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_carry)
-        return particles, monitor_grad, stein_R, n_iter
+        particles, _, grad_particles, stein_R, n_iter, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_carry)
+        return particles, grad_particles, stein_R, n_iter
 
     def solve(
         self,
@@ -336,8 +256,7 @@ class MSVGD():
         atol=1e-2,
         rtol=1e-8,
         bandwidth=-1,
-        grad_clip=None,
-        reweighted_kernel=False,
+        grad_clip=None
     ):
         '''
         Solve mSVGD optimization.
@@ -373,11 +292,6 @@ class MSVGD():
         grad_clip           : float, max global norm for the particle gradient before the
             optimizer step, None to disable. Guards against exploding updates in
             batched/stochastic optimization.
-        reweighted_kernel   : bool, use the density-reweighted kernel (Huang, Dong, Fang [2023],
-            see _reweighted_svgd_update) rather than the standard joint RBF kernel. Amplifies
-            repulsion in low-density regions, countering SVGD's variance-collapse; gave the best
-            credible-interval calibration of the corrective techniques tried on a real
-            high-dimensional ODE-inference benchmark. No effect when is_MAP is True.
         '''
         # dtype carries over if x0 was already a JAX array
         particles = jnp.array(x0)
@@ -395,7 +309,6 @@ class MSVGD():
         rtol              = _listify(rtol, n_phases, particles.dtype)
         bandwidth         = _listify(bandwidth, n_phases, particles.dtype)
         grad_clip         = _listify(grad_clip, n_phases)
-        reweighted_kernel = _listify(reweighted_kernel, n_phases)
 
         monitor_enabled = monitor_convergence > 0
         # inert when monitoring is off (that path isn't compiled in); 1 avoids a mod-by-zero trace
@@ -417,7 +330,7 @@ class MSVGD():
             opt_keys = tuple(sorted(optimizer_kwargs[i]))
             key_sgd, key_mitosis = jr.split(jr.fold_in(key, i))
 
-            particles, monitor_grad, stein_R, n_iter = self._run_phase(
+            particles, grad_particles, stein_R, n_iter = self._run_phase(
                 particles, self.data, key_sgd,
                 opt_kwargs_values=tuple(optimizer_kwargs[i][kw] for kw in opt_keys),
                 grad_clip_value=grad_clip[i] if clip_on else 0.0,
@@ -425,12 +338,11 @@ class MSVGD():
                 phase=i, monitor_interval=monitor_interval,
                 optimizer=optimizer[i], opt_kwargs_keys=opt_keys, is_MAP=is_MAP_i,
                 batch_size=batch_size[i], grad_clip_enabled=clip_on,
-                monitor_enabled=monitor_enabled,
-                reweighted_kernel=bool(reweighted_kernel[i]),
+                monitor_enabled=monitor_enabled
             )
 
             if monitor_convergence >= 0:
-                max_grad = float(jnp.abs(monitor_grad).max())
+                max_grad = float(jnp.abs(grad_particles).max())
                 print(f"Split {i} finished after {int(n_iter)} iterations | "
                       f"max grad = {max_grad:.5f} | Stein R = {float(stein_R):.4f}")
 
